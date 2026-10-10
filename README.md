@@ -40,6 +40,16 @@ browsable with the `<` `>` arrows or by clicking the preset name. Double-click a
 4. Restart Logic. It appears under **Audio Units → Agelin Audio → Selene**.
    If it doesn't, open *Logic → Settings → Plug-in Manager*, select Selene and click *Reset & Rescan Selection*.
 
+## Fast local testing on a Mac (recommended while editing)
+
+```sh
+git clone https://github.com/theodoragelin/Plugin.git && cd Plugin
+./scripts/install-mac.sh      # builds + installs into Logic in one go
+```
+
+After any change (`git pull` to get new edits), just run `./scripts/install-mac.sh` again and
+reopen Logic. Needs Xcode command line tools and cmake (the script tells you if either is missing).
+
 ## Building yourself
 
 ```sh
