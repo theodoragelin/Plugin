@@ -29,6 +29,16 @@ namespace
     juce::String msText (float v, int) { return juce::String (juce::roundToInt (v)) + " ms"; }
     juce::String dbText (float v, int) { return (v > 0.0f ? "+" : "") + juce::String (v, 1) + " dB"; }
 
+    // Transparent below -1 dBFS, then a smooth knee that never exceeds 0 dBFS.
+    inline float softLimit (float x)
+    {
+        constexpr float knee = 0.891f, room = 1.0f - knee;
+        const float a = std::abs (x);
+        if (a <= knee) return x;
+        const float y = knee + room * std::tanh ((a - knee) / room);
+        return x < 0.0f ? -y : y;
+    }
+
     float rms (const float* d, int n)
     {
         double s = 0.0;
@@ -56,6 +66,8 @@ SeleneProcessor::SeleneProcessor()
     pWidth    = apvts.getRawParameterValue (ParamID::width);
     pOutput   = apvts.getRawParameterValue (ParamID::output);
     pModMode  = apvts.getRawParameterValue (ParamID::modMode);
+    pDuck     = apvts.getRawParameterValue (ParamID::duck);
+    pLimit    = apvts.getRawParameterValue (ParamID::limit);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout SeleneProcessor::createLayout()
@@ -91,10 +103,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout SeleneProcessor::createLayou
 
     addFloat (ParamID::width,  "Width",  { 0.0f, 1.5f }, 1.0f, percentText);
     addFloat (ParamID::output, "Output", { -24.0f, 12.0f, 0.1f }, 0.0f, dbText);
+    addFloat (ParamID::duck,   "Duck",   { 0.0f, 1.0f }, 0.0f, percentText);
 
     p.push_back (std::make_unique<AudioParameterChoice> (ParameterID { ParamID::modMode, 1 }, "Mod",
                                                          StringArray { "Lunar", "Drift", "Warble" }, 0));
     p.push_back (std::make_unique<AudioParameterBool> (ParameterID { ParamID::bypass, 1 }, "Bypass", false));
+    p.push_back (std::make_unique<AudioParameterBool> (ParameterID { ParamID::limit, 1 }, "Limit", true));
 
     return { p.begin(), p.end() };
 }
@@ -123,6 +137,10 @@ void SeleneProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     mixSmoothed.setCurrentAndTargetValue (pMix->load());
     outputSmoothed.setCurrentAndTargetValue (juce::Decibels::decibelsToGain (pOutput->load()));
     bypassSmoothed.setCurrentAndTargetValue (bypassParam->get() ? 1.0f : 0.0f);
+
+    duckEnv = 0.0f;
+    duckAttack = 1.0f - std::exp (-1.0f / (0.008f * (float) sampleRate));
+    duckRelease = 1.0f - std::exp (-1.0f / (0.35f * (float) sampleRate));
 }
 
 void SeleneProcessor::reset()
@@ -172,17 +190,32 @@ void SeleneProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
     bypassSmoothed.setTargetValue (bypassParam->get() ? 1.0f : 0.0f);
 
     const float halfPi = juce::MathConstants<float>::halfPi;
+    const float duck = pDuck->load();
+    const bool limit = pLimit->load() > 0.5f;
+
     for (int i = 0; i < numSamples; ++i)
     {
         const float m = mixSmoothed.getNextValue();
         const float g = outputSmoothed.getNextValue();
         const float b = bypassSmoothed.getNextValue();
         const float dryGain = std::cos (m * halfPi);
-        const float wetGain = std::sin (m * halfPi);
+        float wetGain = std::sin (m * halfPi);
 
         const float dl = outL[i], dr = outR[i];
-        const float l = (dl * dryGain + wetL[i] * wetGain) * g;
-        const float r = (dr * dryGain + wetR[i] * wetGain) * g;
+
+        // Ducking: the tail dips while the dry signal plays and blooms in the gaps.
+        const float in = 0.5f * (std::abs (dl) + std::abs (dr));
+        duckEnv += (in - duckEnv) * (in > duckEnv ? duckAttack : duckRelease);
+        wetGain *= 1.0f - duck * 0.85f * juce::jmin (1.0f, duckEnv * 6.0f);
+
+        float l = (dl * dryGain + wetL[i] * wetGain) * g;
+        float r = (dr * dryGain + wetR[i] * wetGain) * g;
+
+        if (limit)
+        {
+            l = softLimit (l);
+            r = softLimit (r);
+        }
 
         if (numOut > 1)
         {
@@ -232,6 +265,7 @@ void SeleneProcessor::setCurrentProgram (int index)
     set (ParamID::width, pr.width);
     set (ParamID::output, pr.output);
     set (ParamID::modMode, (float) pr.modMode);
+    set (ParamID::duck, pr.duck);
 
     ++presetChangeCounter;
 }

@@ -5,6 +5,19 @@ namespace
 {
     constexpr int kWidth = 860;
     constexpr int kHeight = 600;
+
+    // Small four-point sparkle used as the brand mark.
+    void drawSparkle (juce::Graphics& g, juce::Point<float> c, float r)
+    {
+        juce::Path p;
+        p.startNewSubPath (c.x, c.y - r);
+        p.quadraticTo (c.x, c.y, c.x + r, c.y);
+        p.quadraticTo (c.x, c.y, c.x, c.y + r);
+        p.quadraticTo (c.x, c.y, c.x - r, c.y);
+        p.quadraticTo (c.x, c.y, c.x, c.y - r);
+        p.closeSubPath();
+        g.fillPath (p);
+    }
 }
 
 //==============================================================================
@@ -26,21 +39,21 @@ Knob::Knob (juce::AudioProcessorValueTreeState& state, const juce::String& param
 void Knob::resized()
 {
     auto b = getLocalBounds();
-    b.removeFromBottom (isBig ? 36 : 30);
-    slider.setBounds (b);
+    b.removeFromBottom (isBig ? 34 : 30);
+    slider.setBounds (b.withSizeKeepingCentre (juce::jmin (b.getWidth(), b.getHeight()), b.getHeight()));
 }
 
 void Knob::paint (juce::Graphics& g)
 {
     auto b = getLocalBounds();
-    auto labels = b.removeFromBottom (isBig ? 36 : 30);
+    auto labels = b.removeFromBottom (isBig ? 34 : 30);
 
     g.setColour (Palette::text);
-    g.setFont (seleneFont (isBig ? 13.5f : 11.0f, true, 0.18f));
+    g.setFont (seleneFont (isBig ? 11.5f : 9.5f, true, 0.22f));
     g.drawText (name, labels.removeFromTop (isBig ? 18 : 15), juce::Justification::centred);
 
     g.setColour (slider.isMouseOverOrDragging() ? Palette::accent : Palette::textDim);
-    g.setFont (seleneFont (isBig ? 12.0f : 10.5f));
+    g.setFont (seleneFont (isBig ? 10.5f : 9.5f));
     g.drawText (param->getCurrentValueAsText(), labels, juce::Justification::centredTop);
 }
 
@@ -57,6 +70,7 @@ SeleneEditor::SeleneEditor (SeleneProcessor& p)
       highCut  (p.apvts, ParamID::highCut, "High Cut", false),
       width    (p.apvts, ParamID::width, "Width", false),
       mix      (p.apvts, ParamID::mix, "Mix", false),
+      duck     (p.apvts, ParamID::duck, "Duck", false),
       output   (p.apvts, ParamID::output, "Output", false)
 {
     setLookAndFeel (&lnf);
@@ -70,16 +84,23 @@ SeleneEditor::SeleneEditor (SeleneProcessor& p)
     drift.slider.setTooltip ("Pitch drift and movement in the tail. Character is set by the MOD menu.");
     mix.slider.setTooltip ("Dry/wet balance.");
     width.slider.setTooltip ("Stereo width of the reverb.");
+    duck.slider.setTooltip ("Ducks the reverb while the input plays so vocals stay clear; the tail blooms in the gaps.");
 
-    for (auto* k : { &size, &decay, &tape, &drift, &preDelay, &lowCut, &highCut, &width, &mix, &output })
+    for (auto* k : { &size, &decay, &tape, &drift, &preDelay, &lowCut, &highCut, &width, &mix, &duck, &output })
         addAndMakeVisible (k);
 
     bypassButton.setClickingTogglesState (true);
+    bypassButton.getProperties().set ("power", true);
     bypassButton.setTooltip ("Bypass the effect (smooth crossfade).");
     bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (p.apvts, ParamID::bypass, bypassButton);
     addAndMakeVisible (bypassButton);
 
-    modBox.addItemList ({ "MOD: LUNAR", "MOD: DRIFT", "MOD: WARBLE" }, 1);
+    limitButton.setClickingTogglesState (true);
+    limitButton.setTooltip ("Transparent output limiter: catches peaks above -1 dBFS so the output never clips.");
+    limitAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (p.apvts, ParamID::limit, limitButton);
+    addAndMakeVisible (limitButton);
+
+    modBox.addItemList ({ "MOD  LUNAR", "MOD  DRIFT", "MOD  WARBLE" }, 1);
     modBox.setTooltip ("Modulation character used by DRIFT: smooth sines, random wander or tape wow & flutter.");
     modAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (p.apvts, ParamID::modMode, modBox);
     addAndMakeVisible (modBox);
@@ -87,6 +108,9 @@ SeleneEditor::SeleneEditor (SeleneProcessor& p)
     prevButton.onClick = [this] { stepPreset (-1); };
     nextButton.onClick = [this] { stepPreset (1); };
     presetButton.onClick = [this] { showPresetMenu(); };
+    presetButton.getProperties().set ("field", true);
+    prevButton.setButtonText (juce::String::fromUTF8 ("\xe2\x97\x82"));
+    nextButton.setButtonText (juce::String::fromUTF8 ("\xe2\x96\xb8"));
     for (auto* b : { &prevButton, &nextButton, &presetButton })
         addAndMakeVisible (b);
 
@@ -106,63 +130,68 @@ void SeleneEditor::resized()
     sky.setBounds (getLocalBounds());
 
     auto b = getLocalBounds();
-    topBar = b.removeFromTop (50);
+    topBar = b.removeFromTop (34);
+    sky.setTopBarHeight ((float) topBar.getHeight());
     {
-        auto bar = topBar.reduced (16, 10);
-        bypassButton.setBounds (bar.removeFromLeft (84));
-        bar.removeFromLeft (8);
-        modBox.setBounds (bar.removeFromLeft (136));
+        auto bar = topBar.reduced (14, 6);
+        bypassButton.setBounds (bar.removeFromLeft (78));
+        bar.removeFromLeft (10);
+        modBox.setBounds (bar.removeFromLeft (112));
+        limitButton.setBounds (bar.removeFromRight (52));
 
-        auto presetArea = topBar.withSizeKeepingCentre (300, 30);
-        prevButton.setBounds (presetArea.removeFromLeft (30));
-        nextButton.setBounds (presetArea.removeFromRight (30));
-        presetButton.setBounds (presetArea.reduced (4, 0));
+        auto presetArea = topBar.withSizeKeepingCentre (220, 22);
+        presetButton.setBounds (presetArea);
+        prevButton.setBounds (presetArea.getRight() + 6, presetArea.getY(), 20, 22);
+        nextButton.setBounds (presetArea.getRight() + 26, presetArea.getY(), 20, 22);
     }
 
-    titleArea = b.removeFromTop (58);
+    titleArea = b.removeFromTop (78);
 
-    const juce::Rectangle<int> moon (kWidth / 2 - 150, 126, 300, 290);
-    sky.setMoonArea (moon.toFloat());
+    sky.setMoonArea (juce::Rectangle<float> (kWidth / 2.0f - 160.0f, 128.0f, 320.0f, 320.0f));
 
     // Side columns
-    const int sideW = 104, sideH = 100, sideTop = 112, gap = 4;
+    const int sideW = 96, sideH = 96, sideTop = 130, step = 104;
     int y = sideTop;
-    for (auto* k : { &preDelay, &lowCut, &highCut })
+    for (auto* k : { &preDelay, &lowCut, &highCut, &width })
     {
-        k->setBounds (54, y, sideW, sideH);
-        y += sideH + gap;
+        k->setBounds (36, y, sideW, sideH);
+        y += step;
     }
     y = sideTop;
-    for (auto* k : { &mix, &width, &output })
+    for (auto* k : { &mix, &duck, &output })
     {
-        k->setBounds (kWidth - 54 - sideW, y, sideW, sideH);
-        y += sideH + gap;
+        k->setBounds (kWidth - 36 - sideW, y, sideW, sideH);
+        y += step;
     }
 
-    // Big macro row
-    const int bigW = 140, bigH = 148;
-    const int rowX = (kWidth - 4 * bigW - 3 * 26) / 2;
-    int x = rowX;
+    // Macro row under the moon
+    const int bigW = 118, bigH = 122, gap = 26;
+    int x = (kWidth - 4 * bigW - 3 * gap) / 2;
     for (auto* k : { &size, &decay, &tape, &drift })
     {
         k->setBounds (x, kHeight - bigH - 14, bigW, bigH);
-        x += bigW + 26;
+        x += bigW + gap;
     }
 }
 
 void SeleneEditor::paintOverChildren (juce::Graphics& g)
 {
-    // Title
-    g.setColour (Palette::text);
-    g.setFont (seleneFont (30.0f, true, 0.42f));
-    g.drawText ("SELENE", titleArea.withTrimmedBottom (18), juce::Justification::centredBottom);
-    g.setColour (Palette::textDim);
-    g.setFont (seleneFont (10.5f, false, 0.35f));
-    g.drawText ("LUNAR ALGORITHMIC REVERB", titleArea.withTrimmedTop (titleArea.getHeight() - 18), juce::Justification::centredTop);
+    // Top bar
+    g.setColour (Palette::barLine);
+    g.drawHorizontalLine (topBar.getBottom(), 0.0f, (float) getWidth());
 
-    // Top bar divider
-    g.setColour (Palette::outline.withAlpha (0.6f));
-    g.drawHorizontalLine (topBar.getBottom(), 16.0f, (float) getWidth() - 16.0f);
+    // Title
+    auto t = titleArea.withTrimmedTop (10);
+    g.setColour (Palette::text);
+    g.setFont (seleneFont (40.0f, true, 0.06f));
+    g.drawText ("SELENE", t.removeFromTop (46), juce::Justification::centredBottom);
+    g.setColour (Palette::textDim);
+    g.setFont (seleneFont (8.5f, true, 0.32f));
+    g.drawText ("by AGELIN AUDIO", t.removeFromTop (16), juce::Justification::centred);
+
+    // Brand sparkle, bottom-right like a signature
+    g.setColour (Palette::text.withAlpha (0.55f));
+    drawSparkle (g, { (float) getWidth() - 84.0f, (float) getHeight() - 74.0f }, 9.0f);
 }
 
 void SeleneEditor::timerCallback()
@@ -190,7 +219,7 @@ void SeleneEditor::timerCallback()
              || differs (s.drift, pr.drift) || differs (s.mix, pr.mix) || differs (get (ParamID::preDelay), pr.preDelay)
              || differs (get (ParamID::lowCut), pr.lowCut) || differs (get (ParamID::highCut), pr.highCut)
              || differs (get (ParamID::width), pr.width) || differs (get (ParamID::output), pr.output)
-             || (int) get (ParamID::modMode) != pr.modMode;
+             || (int) get (ParamID::modMode) != pr.modMode || differs (get (ParamID::duck), pr.duck);
     }
     if (counter != lastPresetCounter || dirty != presetDirty)
     {
@@ -223,5 +252,5 @@ void SeleneEditor::showPresetMenu()
 void SeleneEditor::refreshPresetLabel()
 {
     auto name = processor.getProgramName (processor.getCurrentProgram());
-    presetButton.setButtonText (presetDirty ? name + " *" : name);
+    presetButton.setButtonText ((presetDirty ? name + " *" : name) + juce::String::fromUTF8 ("  \xe2\x96\xbe"));
 }

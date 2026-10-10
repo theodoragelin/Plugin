@@ -19,7 +19,9 @@ to the sound, and a reverse-style **inverted decay**.
 | Low Cut / High Cut | Filters on the reverb only. |
 | Mix | Dry/wet (equal-power). |
 | Width | Stereo width of the reverb (0 – 150%). |
+| Duck | Dips the reverb while the input plays and lets it bloom in the gaps — keeps vocals clear. |
 | Output | Output gain. |
+| Limit | Transparent output limiter (on by default): untouched below -1 dBFS, never clips. |
 | Bypass | Click-free bypass (also mapped to the DAW's bypass). |
 
 12 factory presets (Moonrise Vocal, Lunar Pad, Tape Haze, Inverted Tide, Endless Night…),
@@ -58,11 +60,13 @@ swells, and wet/dry loudness; writes impulse responses and demo renders as WAV f
 
 ## How it works
 
-`Source/dsp/MoonReverb.h` — pre-delay → 4-stage allpass input diffusion per channel →
-(optional rising multi-tap "swell" for inverted decay) → 8-line feedback delay network with a
-Hadamard mixing matrix, per-line modulated delay times (Drift), and tape saturation + damping
-in the loop (Tape). Feedback gains are computed from the target RT60 so Decay is accurate at
-every Size.
+`Source/dsp/MoonReverb.h` — pre-delay → size-scaled early reflections + 6-stage allpass input
+diffusion per channel → (optional rising multi-tap "swell" for inverted decay) → 8-line feedback
+delay network with a Hadamard mixing matrix, an allpass inside every line for a dense, smooth
+tail, per-line modulated delay times (Drift), tape saturation + damping in the loop (Tape) and a
+slightly shorter bass decay so long tails stay clear. Feedback gains are computed from the target
+RT60 so Decay is accurate at every Size, and the wet level is loudness-normalised so changing
+Size/Decay doesn't jump in volume. At high Drift a drifting-clock resampler adds lo-fi grit.
 
 Built with [JUCE](https://juce.com) 8 (GPLv3 / commercial licence — check JUCE's terms before
 selling the plugin).

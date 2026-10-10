@@ -86,18 +86,19 @@ static std::vector<float> envelopeDb (const Result& r)
     return env;
 }
 
-// RT60 estimate from the slope between -5 dB and -25 dB below peak (T20 * 3).
+// RT60 estimate from the late-tail slope between -10 dB and -30 dB below peak (T20 * 3),
+// skipping the early-reflection region so it measures the reverb tail itself.
 static float estimateRT60 (const Result& r)
 {
     auto env = envelopeDb (r);
-    size_t peakIdx = 0;
-    for (size_t i = 0; i < env.size(); ++i) if (env[i] > env[peakIdx]) peakIdx = i;
+    size_t peakIdx = 12; // start after the first 120 ms (early reflections)
+    for (size_t i = 12; i < env.size(); ++i) if (env[i] > env[peakIdx]) peakIdx = i;
     const float pk = env[peakIdx];
     int a = -1, b = -1;
     for (size_t i = peakIdx; i < env.size(); ++i)
     {
-        if (a < 0 && env[i] < pk - 5.0f) a = (int) i;
-        if (b < 0 && env[i] < pk - 25.0f) { b = (int) i; break; }
+        if (a < 0 && env[i] < pk - 10.0f) a = (int) i;
+        if (b < 0 && env[i] < pk - 30.0f) { b = (int) i; break; }
     }
     if (a < 0 || b < 0) return -1.0f;
     return (float) ((b - a) * 0.01 * 3.0);

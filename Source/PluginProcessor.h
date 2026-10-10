@@ -19,6 +19,8 @@ namespace ParamID
     inline constexpr const char* output   = "output";
     inline constexpr const char* modMode  = "modmode";
     inline constexpr const char* bypass   = "bypass";
+    inline constexpr const char* duck     = "duck";
+    inline constexpr const char* limit    = "limit";
 }
 
 class SeleneProcessor : public juce::AudioProcessor
@@ -81,6 +83,10 @@ private:
     std::atomic<float>* pWidth = nullptr;
     std::atomic<float>* pOutput = nullptr;
     std::atomic<float>* pModMode = nullptr;
+    std::atomic<float>* pDuck = nullptr;
+    std::atomic<float>* pLimit = nullptr;
+
+    float duckEnv = 0.0f, duckAttack = 0.0f, duckRelease = 0.0f;
 
     int currentPreset = 0;
 

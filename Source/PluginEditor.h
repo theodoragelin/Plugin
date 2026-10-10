@@ -46,15 +46,15 @@ private:
     SkyView sky;
 
     // Top bar
-    juce::TextButton bypassButton { "BYPASS" };
+    juce::TextButton bypassButton { "BYPASS" }, limitButton { "LIMIT" };
     juce::ComboBox modBox;
-    juce::TextButton prevButton { "<" }, nextButton { ">" }, presetButton;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
+    juce::TextButton prevButton, nextButton, presetButton;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment, limitAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modAttachment;
 
     // Main controls
     Knob size, decay, tape, drift;
-    Knob preDelay, lowCut, highCut, width, mix, output;
+    Knob preDelay, lowCut, highCut, width, mix, duck, output;
 
     juce::TooltipWindow tooltips { this, 600 };
     int lastPresetCounter = -1;

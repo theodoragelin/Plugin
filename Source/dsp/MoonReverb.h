@@ -3,11 +3,13 @@
 // Selene reverb engine — framework-free so it can be unit-tested without JUCE.
 //
 // Signal flow (per channel pair):
-//   input -> pre-delay -> input diffusion (4 allpasses / channel)
-//         -> [optional "inverted" swell: rising multi-tap delay]
-//         -> 8-line modulated feedback delay network (Hadamard mix,
-//            per-line tape saturation + damping, RT60-matched gains)
-//         -> stereo taps -> width -> low/high cut -> wet out
+//   input -> pre-delay -+-> early reflections (size-scaled multi-tap) ----------+
+//                       +-> input diffusion (6 allpasses / channel)               |
+//         -> [optional "inverted" swell: rising multi-tap delay]                  |
+//         -> 8-line modulated feedback delay network (Hadamard mix, in-loop       |
+//            allpass per line for density, two-band RT60-matched decay with       |
+//            shorter bass decay, tape saturation + damping)                       |
+//         -> stereo taps (+ ER) -> lo-fi (high Drift) -> width -> low/high cut ->-+-> loudness-normalised wet out
 //
 // Macro controls:
 //   size  0..1   scales every delay line (room scale)
@@ -185,16 +187,19 @@ public:
 
         switch (mode)
         {
-            case 1:  return current;
-            case 2:  return 0.75f * std::sin (2.0f * kPi * wowPhase)
-                            + 0.12f * std::sin (2.0f * kPi * flutterPhase + phase * 6.0f)
-                            + 0.25f * current;
-            default: return std::sin (2.0f * kPi * phase);
+            case 1:  lastValue = current; break;
+            case 2:  lastValue = 0.75f * std::sin (2.0f * kPi * wowPhase)
+                               + 0.12f * std::sin (2.0f * kPi * flutterPhase + phase * 6.0f)
+                               + 0.25f * current; break;
+            default: lastValue = std::sin (2.0f * kPi * phase); break;
         }
+        return lastValue;
     }
 
+    float last() const { return lastValue; }
+
 private:
-    float fs = 48000.0f, phase = 0.0f, sineRate = 0.2f;
+    float fs = 48000.0f, phase = 0.0f, sineRate = 0.2f, lastValue = 0.0f;
     float randPhase = 0.0f, randRate = 0.5f, start = 0.0f, current = 0.0f, target = 0.0f;
     Rng rng;
 };
@@ -218,7 +223,7 @@ class MoonReverb
 {
 public:
     static constexpr int kLines = 8;
-    static constexpr int kDiffusers = 4;
+    static constexpr int kDiffusers = 6;
     static constexpr int kSwellTaps = 40;
 
     void prepare (double sampleRate, int /*maxBlockSize*/)
@@ -231,12 +236,15 @@ public:
             const float maxMs = kLineMs[i] * kMaxSizeScale + kMaxModMs + 2.0f;
             lines[i].prepare ((int) (maxMs * msToS) + 8);
             mods[i].prepare (fs, i);
-            damp[i] = 0.0f;
+            loopAp[i].prepare ((int) (kLoopApMs[i] * std::sqrt (kMaxSizeScale) * msToS) + 8);
+            damp[i] = bass[i] = 0.0f;
         }
 
         for (int c = 0; c < 2; ++c)
         {
             preDelay[c].prepare ((int) (0.52 * fs) + 8);
+            erLine[c].prepare ((int) (kErMaxMs * 0.001 * fs * (0.4 + 0.6 * kMaxSizeScale)) + 8);
+            holdValue[c] = 0.0f;
             swellLine[c].prepare ((int) (kMaxSwellSeconds * fs) + 8);
             for (int d = 0; d < kDiffusers; ++d)
                 diffusers[c][d].prepare ((int) (kDiffMs[c][d] * kMaxSizeScale * msToS) + 8);
@@ -246,6 +254,7 @@ public:
         }
 
         // Smoothing coefficients (one-pole).
+        bassCoeff = 1.0f - std::exp (-2.0f * kPi * 220.0f / (float) fs);
         slowCoeff = 1.0f - std::exp (-1.0f / (0.25f * (float) fs)); // ~250 ms
         fastCoeff = 1.0f - std::exp (-1.0f / (0.03f * (float) fs)); // ~30 ms
 
@@ -258,9 +267,12 @@ public:
     void reset()
     {
         for (auto& l : lines) l.clear();
+        for (auto& a : loopAp) a.clear();
         for (int c = 0; c < 2; ++c)
         {
             preDelay[c].clear();
+            erLine[c].clear();
+            holdValue[c] = 0.0f;
             swellLine[c].clear();
             for (auto& d : diffusers[c]) d.clear();
             lowCut[c].clear();
@@ -268,6 +280,8 @@ public:
             dcState[c] = dcPrev[c] = 0.0f;
         }
         damp.fill (0.0f);
+        bass.fill (0.0f);
+        holdPhase = 1.0f;
     }
 
     void setParams (const ReverbParams& p)
@@ -321,11 +335,23 @@ public:
                 x[c] = preDelayS < 0.05f ? x[c] : preDelay[c].readFrac (pd + 1.0f);
             }
 
+            // --- early reflections: sparse, panned taps that give the room its shape
+            const float erScale = 0.4f + 0.6f * sizeScaleS;
+            float er[2] = { 0.0f, 0.0f };
+            for (int c = 0; c < 2; ++c)
+            {
+                erLine[c].push (x[c]);
+                for (int t = 0; t < kErTaps; ++t)
+                    er[c] += erLine[c].readFrac (kErMs[c][t] * erScale * msToS + 3.0f) * kErGain[t];
+            }
+
             // --- input diffusion
-            const float diffScale = 0.55f + 0.45f * sizeScaleS;
+            // Diffusion is backed off for short decays so tight settings stay tight.
+            const float diffScale = 0.35f + 0.65f * sizeScaleS;
+            const float diffAmt = 0.45f + 0.55f * std::clamp ((rtS - 0.25f) / 1.5f, 0.0f, 1.0f);
             for (int c = 0; c < 2; ++c)
                 for (int d = 0; d < kDiffusers; ++d)
-                    x[c] = diffusers[c][d].process (x[c], kDiffMs[c][d] * diffScale * msToS, kDiffGain[d]);
+                    x[c] = diffusers[c][d].process (x[c], kDiffMs[c][d] * diffScale * msToS, kDiffGain[d] * diffAmt);
 
             // --- inverted swell (reverse-style build-up)
             if (invertS > 0.001f)
@@ -346,6 +372,9 @@ public:
             }
 
             // --- feedback delay network
+            if ((n & 15) == 0)
+                updateLoopGains (msToS);
+
             const float modDepth = (kBaseModMs + std::pow (driftS, 1.5f) * (kMaxModMs - kBaseModMs)) * msToS;
             const float dampCoeff = dampingCoeff (tapeS);
             const float drive = 1.0f + 3.0f * tapeS;
@@ -365,18 +394,45 @@ public:
 
             hadamard8 (y);
 
+            const float apScale = std::sqrt (sizeScaleS) * msToS;
             for (int i = 0; i < kLines; ++i)
             {
-                const float lenS = kLineMs[i] * sizeScaleS * msToS;
-                const float g = std::pow (10.0f, -3.0f * lenS / (rtS * (float) fs));
-
-                // Tape: one-pole loop damping + soft saturation.
+                // Tape: one-pole loop damping.
                 damp[i] += (y[i] - damp[i]) * dampCoeff;
-                float v = damp[i] * g;
+
+                // Two-band decay: lows die a little faster than mids so long tails stay clear.
+                bass[i] += (damp[i] - bass[i]) * bassCoeff;
+                float v = damp[i] * loopGain[i] + bass[i] * (loopGainBass[i] - loopGain[i]);
+
+                // Tape: soft saturation inside the loop.
                 v = std::tanh (v * drive) * invDrive;
+
+                // In-loop allpass multiplies echo density without colouring the tone.
+                v = loopAp[i].process (v, kLoopApMs[i] * apScale, (i & 1) ? 0.55f : -0.55f);
 
                 const float inject = (i < kLines / 2 ? x[0] : x[1]) * 0.35f;
                 lines[i].push (v + inject);
+            }
+
+            // Early reflections fade out as the space grows; inverted mode skips them.
+            const float erAmt = (0.3f - 0.18f * params.size) * (1.0f - invertS);
+            outL += er[0] * erAmt;
+            outR += er[1] * erAmt;
+
+            // Lo-fi: at high Drift the tail is resampled with a drifting clock.
+            const float lofi = std::clamp ((driftS - 0.55f) / 0.45f, 0.0f, 1.0f);
+            if (lofi > 0.001f)
+            {
+                holdPhase += 1.0f - 0.72f * lofi * (0.85f + 0.15f * mods[0].last());
+                if (holdPhase >= 1.0f)
+                {
+                    holdPhase -= 1.0f;
+                    holdValue[0] = outL;
+                    holdValue[1] = outR;
+                }
+                const float blend = 0.6f * lofi;
+                outL += (holdValue[0] - outL) * blend;
+                outR += (holdValue[1] - outR) * blend;
             }
 
             // --- width, DC block, cut filters
@@ -394,8 +450,8 @@ public:
                 o[c] = highCut[c].process (lowCut[c].process (dc));
             }
 
-            wetL[n] = safetyClip (o[0] * kWetGain);
-            wetR[n] = safetyClip (o[1] * kWetGain);
+            wetL[n] = safetyClip (o[0] * kWetGain * loudnessGain);
+            wetR[n] = safetyClip (o[1] * kWetGain * loudnessGain);
         }
     }
 
@@ -411,7 +467,26 @@ private:
         return x < 0.0f ? -y : y;
     }
 
-    static float sizeToScale (float size) { return 0.25f + 2.25f * size * size + 0.25f * size; }
+    static float sizeToScale (float size) { return 0.45f + 2.05f * size * size + 0.25f * size; }
+
+    // Per-line feedback gains for the target RT60 (mid band, and a shorter bass band),
+    // plus a loudness normaliser so long/large settings don't jump out in level.
+    void updateLoopGains (float msToS)
+    {
+        const float apScale = std::sqrt (sizeScaleS);
+        float gSum = 0.0f;
+        for (int i = 0; i < kLines; ++i)
+        {
+            const float lenS = (kLineMs[i] * sizeScaleS + kLoopApMs[i] * apScale) * msToS;
+            const float g = std::pow (10.0f, -3.0f * lenS / (rtS * (float) fs));
+            loopGain[i] = g;
+            loopGainBass[i] = std::pow (g, 1.0f / kBassDecayRatio);
+            gSum += g * g;
+        }
+        const float energy = 1.0f / std::max (1.0e-4f, 1.0f - gSum / (float) kLines);
+        const float scaleComp = std::sqrt (sizeScaleS);
+        loudnessGain = std::clamp (std::pow (energy, -0.5f * kLoudnessComp) * kLoudnessRef * std::pow (scaleComp, 0.5f), 0.2f, 4.0f);
+    }
 
     // RT60 in seconds. Normal: 0.25 s .. ~30 s. Inverted: short smear behind the swell.
     float targetRT60() const
@@ -486,8 +561,17 @@ private:
 
     // Mutually prime-ish base lengths (ms) at size scale 1.
     static constexpr float kLineMs[kLines] = { 29.7f, 37.1f, 41.9f, 47.3f, 53.9f, 61.1f, 67.7f, 79.3f };
-    static constexpr float kDiffMs[2][kDiffusers] = { { 4.71f, 3.59f, 12.73f, 9.31f }, { 4.97f, 3.37f, 13.19f, 8.83f } };
-    static constexpr float kDiffGain[kDiffusers] = { 0.72f, 0.72f, 0.62f, 0.62f };
+    static constexpr float kDiffMs[2][kDiffusers] = { { 4.71f, 3.59f, 12.73f, 9.31f, 23.3f, 17.9f }, { 4.97f, 3.37f, 13.19f, 8.83f, 22.1f, 18.7f } };
+    static constexpr float kDiffGain[kDiffusers] = { 0.72f, 0.72f, 0.65f, 0.65f, 0.6f, 0.6f };
+    static constexpr float kLoopApMs[kLines] = { 3.13f, 4.07f, 4.91f, 5.83f, 6.71f, 7.39f, 8.27f, 9.11f };
+    static constexpr int kErTaps = 10;
+    static constexpr float kErMaxMs = 48.0f;
+    static constexpr float kErMs[2][kErTaps] = { { 4.3f, 7.9f, 11.2f, 15.7f, 19.1f, 23.9f, 29.3f, 34.1f, 40.3f, 47.2f },
+                                                 { 5.1f, 8.8f, 12.9f, 14.6f, 21.4f, 26.2f, 27.9f, 36.6f, 42.8f, 45.9f } };
+    static constexpr float kErGain[kErTaps] = { 0.62f, -0.5f, 0.45f, 0.38f, -0.33f, 0.28f, -0.24f, 0.2f, 0.16f, -0.13f };
+    static constexpr float kBassDecayRatio = 0.8f;
+    static constexpr float kLoudnessComp = 0.35f;
+    static constexpr float kLoudnessRef = 1.0f;
     static constexpr float kMaxSizeScale = 2.75f;
     static constexpr float kBaseModMs = 0.12f;
     static constexpr float kMaxModMs = 3.5f;
@@ -500,7 +584,10 @@ private:
 
     std::array<DelayLine, kLines> lines;
     std::array<Modulator, kLines> mods;
-    std::array<float, kLines> damp {};
+    std::array<float, kLines> damp {}, bass {}, loopGain {}, loopGainBass {};
+    std::array<Allpass, kLines> loopAp;
+    DelayLine erLine[2];
+    float holdValue[2] {}, holdPhase = 1.0f, bassCoeff = 0.03f, loudnessGain = 1.0f;
 
     DelayLine preDelay[2];
     DelayLine swellLine[2];
